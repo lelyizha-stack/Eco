@@ -278,3 +278,236 @@ def set_value_by_path(obj, path: str, new_value):
         return True
 
     raise TypeError(f"Tidak bisa set nilai pada tipe: {type(ref).__name__}")
+    @app.get("/")
+def root():
+    return {"ok": True, "message": "Eco backend aktif"}
+
+
+@app.post("/api/renpy/test-upload")
+async def test_upload(file: UploadFile = File(...)):
+    content = await file.read()
+    return JSONResponse({
+        "ok": True,
+        "filename": file.filename,
+        "size": len(content),
+    })
+
+
+@app.post("/api/renpy/inspect")
+async def renpy_inspect(file: UploadFile = File(...)):
+    content = await file.read()
+
+    if not content:
+        raise HTTPException(status_code=400, detail="File kosong.")
+
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="File terlalu besar.")
+
+    result = {
+        "ok": True,
+        "filename": file.filename,
+        "size": len(content),
+        "is_zip": False,
+        "entries": [],
+        "has_log": False,
+        "has_json": False,
+        "has_screenshot": False,
+        "json_preview": None,
+    }
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(content), "r") as zf:
+            names = zf.namelist()
+
+            result["is_zip"] = True
+            result["entries"] = names
+            result["has_log"] = "log" in names
+            result["has_json"] = "json" in names
+            result["has_screenshot"] = "screenshot.png" in names
+
+            if "json" in names:
+                try:
+                    json_text = zf.read("json").decode("utf-8", errors="replace")
+                    parsed = json.loads(json_text)
+
+                    if isinstance(parsed, dict):
+                        result["json_preview"] = {
+                            key: parsed[key]
+                            for key in list(parsed.keys())[:10]
+                        }
+                    else:
+                        result["json_preview"] = parsed
+                except Exception as e:
+                    result["json_preview"] = {
+                        "error": f"Gagal parse entry json: {str(e)}"
+                    }
+
+            return JSONResponse(result)
+
+    except zipfile.BadZipFile:
+        return JSONResponse({
+            "ok": False,
+            "filename": file.filename,
+            "size": len(content),
+            "error": "File ini bukan ZIP Ren'Py yang valid.",
+        })
+
+
+@app.post("/api/renpy/read-log")
+async def renpy_read_log(file: UploadFile = File(...)):
+    content = await file.read()
+
+    if not content:
+        raise HTTPException(status_code=400, detail="File kosong.")
+
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="File terlalu besar.")
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(content), "r") as zf:
+            names = zf.namelist()
+
+            if "log" not in names:
+                raise HTTPException(status_code=400, detail="Entry 'log' tidak ditemukan.")
+
+            log_bytes = zf.read("log")
+
+            return JSONResponse({
+                "ok": True,
+                "filename": file.filename,
+                "entries": names,
+                "log_size": len(log_bytes),
+                "log_sha256": hashlib.sha256(log_bytes).hexdigest(),
+                "log_base64": base64.b64encode(log_bytes).decode("ascii"),
+            })
+
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="File ini bukan ZIP Ren'Py yang valid.")
+
+
+@app.post("/api/renpy/find-candidates")
+async def renpy_find_candidates(file: UploadFile = File(...)):
+    content = await file.read()
+
+    if not content:
+        raise HTTPException(status_code=400, detail="File kosong.")
+
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="File terlalu besar.")
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(content), "r") as zf:
+            names = zf.namelist()
+
+            if "log" not in names:
+                raise HTTPException(status_code=400, detail="Entry 'log' tidak ditemukan.")
+
+            log_bytes = zf.read("log")
+
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="File ini bukan ZIP Ren'Py yang valid.")
+
+    try:
+        parsed = tolerant_load_pickle(log_bytes)
+        scan_root = get_scan_root(parsed)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Gagal parse pickle log: {type(e).__name__}: {str(e)}",
+        )
+
+    candidates = scan_money_candidates(scan_root)
+
+    seen = set()
+    unique_candidates = []
+    for item in sorted(candidates, key=lambda x: (x["score"], x["path"])):
+        sig = (item["path"], item["value"])
+        if sig in seen:
+            continue
+        seen.add(sig)
+        unique_candidates.append({
+            "path": item["path"],
+            "value": item["value"],
+        })
+
+    return JSONResponse({
+        "ok": True,
+        "filename": file.filename,
+        "entries": names,
+        "parsed_type": type(parsed).__name__,
+        "scan_root_type": type(scan_root).__name__,
+        "candidate_count": len(unique_candidates),
+        "candidates": unique_candidates[:100],
+    })
+
+
+@app.post("/api/renpy/edit-money")
+async def renpy_edit_money(
+    file: UploadFile = File(...),
+    path: str = "store.money",
+    value: int = 999999
+):
+    content = await file.read()
+
+    if not content:
+        raise HTTPException(status_code=400, detail="File kosong.")
+
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="File terlalu besar.")
+
+    original_entries = {}
+    names = []
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(content), "r") as zf:
+            names = zf.namelist()
+
+            if "log" not in names:
+                raise HTTPException(status_code=400, detail="Entry 'log' tidak ditemukan.")
+
+            for name in names:
+                original_entries[name] = zf.read(name)
+
+            log_bytes = original_entries["log"]
+
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="File ini bukan ZIP Ren'Py yang valid.")
+
+    try:
+        parsed = tolerant_load_pickle(log_bytes)
+        scan_root = get_scan_root(parsed)
+        set_value_by_path(scan_root, path, value)
+        new_log_bytes = pickle.dumps(parsed, protocol=4)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Gagal edit pickle log: {type(e).__name__}: {str(e)}",
+        )
+
+    out = io.BytesIO()
+
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name in names:
+            if name == "log":
+                zf.writestr("log", new_log_bytes)
+            else:
+                zf.writestr(name, original_entries[name])
+
+    edited_bytes = out.getvalue()
+    edited_name = file.filename
+    if edited_name.endswith(".save"):
+        edited_name = edited_name[:-5] + "-edited.save"
+    else:
+        edited_name = edited_name + "-edited.save"
+
+    return JSONResponse({
+        "ok": True,
+        "filename": file.filename,
+        "edited_filename": edited_name,
+        "path": path,
+        "new_value": value,
+        "old_log_sha256": hashlib.sha256(log_bytes).hexdigest(),
+        "new_log_sha256": hashlib.sha256(new_log_bytes).hexdigest(),
+        "edited_save_base64": base64.b64encode(edited_bytes).decode("ascii"),
+        "warning": "Save berhasil direpack, tetapi game dengan entry signatures bisa saja menolak file jika signature ikut diverifikasi.",
+    })
