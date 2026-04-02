@@ -169,30 +169,48 @@ def get_scan_root(parsed):
 
 
 def set_value_by_path(obj, path: str, new_value):
+    if isinstance(obj, dict) and path in obj:
+        obj[path] = new_value
+        return True
+
     parts = path.split(".")
     ref = obj
 
-    for part in parts[:-1]:
+    for i, part in enumerate(parts[:-1]):
         if isinstance(ref, dict):
+            remaining = ".".join(parts[i:])
+            if remaining in ref:
+                ref[remaining] = new_value
+                return True
+
             if part not in ref:
                 raise KeyError(f"Path tidak ditemukan: {path}")
             ref = ref[part]
+
         elif isinstance(ref, list):
             idx = int(part)
             ref = ref[idx]
+
         elif isinstance(ref, tuple):
             idx = int(part)
             ref = ref[idx]
+
         else:
             raise TypeError(f"Tidak bisa menelusuri path pada tipe: {type(ref).__name__}")
 
     last = parts[-1]
 
     if isinstance(ref, dict):
-        if last not in ref:
-            raise KeyError(f"Path tidak ditemukan: {path}")
-        ref[last] = new_value
-        return True
+        if last in ref:
+            ref[last] = new_value
+            return True
+
+        full_path = ".".join(parts)
+        if full_path in ref:
+            ref[full_path] = new_value
+            return True
+
+        raise KeyError(f"Path tidak ditemukan: {path}")
 
     if isinstance(ref, list):
         idx = int(last)
