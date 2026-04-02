@@ -35,15 +35,18 @@ class GenericPlaceholder:
 
 
 class RenpyRevertableList(list):
-    pass
+    def __setstate__(self, state):
+        self._state = state
 
 
 class RenpyRevertableDict(dict):
-    pass
+    def __setstate__(self, state):
+        self._state = state
 
 
 class RenpyRevertableSet(set):
-    pass
+    def __setstate__(self, state):
+        self._state = state
 
 
 def get_placeholder_type(module: str, name: str):
@@ -71,7 +74,6 @@ class LenientUnpickler(pickle.Unpickler):
 
         if module == "builtins":
             import builtins
-
             if hasattr(builtins, name):
                 return getattr(builtins, name)
 
@@ -108,7 +110,7 @@ def candidate_score(path: str) -> int:
     return 50
 
 
-def scan_money_candidates(obj, path="", out=None, seen=None, depth=0, max_depth=6):
+def scan_money_candidates(obj, path="", out=None, seen=None, depth=0, max_depth=8):
     if out is None:
         out = []
     if seen is None:
@@ -158,6 +160,12 @@ def scan_money_candidates(obj, path="", out=None, seen=None, depth=0, max_depth=
         scan_money_candidates(vars(obj), f"{path}.__dict__" if path else "__dict__", out, seen, depth + 1, max_depth)
 
     return out
+
+
+def get_scan_root(parsed):
+    if isinstance(parsed, tuple) and len(parsed) >= 1 and isinstance(parsed[0], dict):
+        return parsed[0]
+    return parsed
 
 
 @app.get("/")
@@ -291,13 +299,14 @@ async def renpy_find_candidates(file: UploadFile = File(...)):
 
     try:
         parsed = tolerant_load_pickle(log_bytes)
+        scan_root = get_scan_root(parsed)
     except Exception as e:
         raise HTTPException(
             status_code=400,
             detail=f"Gagal parse pickle log: {type(e).__name__}: {str(e)}",
         )
 
-    candidates = scan_money_candidates(parsed)
+    candidates = scan_money_candidates(scan_root)
 
     seen = set()
     unique_candidates = []
@@ -316,6 +325,7 @@ async def renpy_find_candidates(file: UploadFile = File(...)):
         "filename": file.filename,
         "entries": names,
         "parsed_type": type(parsed).__name__,
+        "scan_root_type": type(scan_root).__name__,
         "candidate_count": len(unique_candidates),
         "candidates": unique_candidates[:100],
     })
