@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import io
 import json
 import zipfile
@@ -14,6 +15,19 @@ from urllib.request import urlopen
 from urllib.error import URLError, HTTPError
 
 app = FastAPI(title="Eco RenPy Backend")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://karbitprime.fun",
+        "https://www.karbitprime.fun",
+        "http://localhost:3000",
+        "http://127.0.0.1:5500",
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
 
