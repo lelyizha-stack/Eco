@@ -10,9 +10,11 @@ import pickle
 import re
 import sys
 import types
+import time
 from collections import defaultdict
 from urllib.request import urlopen
 from urllib.error import URLError, HTTPError
+from difflib import get_close_matches
 
 app = FastAPI(title="Eco RenPy Backend")
 
@@ -30,7 +32,6 @@ app.add_middleware(
 )
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
-
 RENPY_RULES_URL = "https://script.google.com/macros/s/AKfycbzeCFEGNVwhnwYrdp6JlIh8sJOa0zYSe8w8TneyRQ-2swWwd7WoukEUb95n_3SzRy-dqg/exec"
 
 MONEY_RE = re.compile(
@@ -38,8 +39,15 @@ MONEY_RE = re.compile(
     re.IGNORECASE,
 )
 
+BAD_CANDIDATE_RE = re.compile(
+    r"(__dict__|(^|\.)(_state|state)(\.|$)|(^|\.)(c_\d+)(\.|$)|usedgold|spentgold|costgold|requiregold|needgold|consumegold|paygold|stsgold|_stsusedgold)",
+    re.IGNORECASE,
+)
+
 _PLACEHOLDER_CACHE = {}
 _RULES_CACHE = None
+_RULES_CACHE_TS = 0.0
+_RULES_CACHE_TTL = 60.0
 
 
 def ensure_fake_module(module_name: str):
@@ -119,10 +127,8 @@ def make_revertable_set(module_name: str):
 
 RenpyRevertableList = make_revertable_list("renpy.revertable")
 RenpyPythonRevertableList = make_revertable_list("renpy.python")
-
 RenpyRevertableDict = make_revertable_dict("renpy.revertable")
 RenpyPythonRevertableDict = make_revertable_dict("renpy.python")
-
 RenpyRevertableSet = make_revertable_set("renpy.revertable")
 RenpyPythonRevertableSet = make_revertable_set("renpy.python")
 
@@ -164,33 +170,57 @@ def tolerant_load_pickle(data: bytes):
 
 
 def candidate_score(path: str) -> int:
-    p = path.lower()
+    p = str(path or "").lower()
+
+    if BAD_CANDIDATE_RE.search(p):
+        return 1000
 
     if p == "store.money" or p.endswith(".money"):
         return 0
-    if "money" in p:
+    if p == "store.cash" or p.endswith(".cash"):
         return 1
     if p == "store.gold" or p.endswith(".gold"):
         return 2
-    if "gold" in p:
+    if p == "store.coin" or p.endswith(".coin"):
         return 3
-    if "cash" in p:
+    if p == "store.coins" or p.endswith(".coins"):
         return 4
-    if "coin" in p or "เหรียญ" in p:
+    if p == "store.credit" or p.endswith(".credit"):
         return 5
-    if "credit" in p or "เครดิต" in p:
+    if p == "store.credits" or p.endswith(".credits"):
         return 6
-    if "wallet" in p:
-        return 7
-    if "fund" in p:
-        return 8
-    if "balance" in p:
-        return 9
-    if "เงิน" in p or "uang" in p or "duit" in p:
+
+    if "money" in p:
         return 10
-    if "ทอง" in p or "emas" in p:
+    if "cash" in p:
         return 11
+    if "gold" in p:
+        return 12
+    if "coin" in p or "เหรียญ" in p:
+        return 13
+    if "credit" in p or "เครดิต" in p:
+        return 14
+    if "wallet" in p:
+        return 15
+    if "fund" in p:
+        return 16
+    if "balance" in p:
+        return 17
+    if "เงิน" in p or "uang" in p or "duit" in p:
+        return 18
+    if "ทอง" in p or "emas" in p:
+        return 19
+
     return 50
+
+
+def should_include_candidate(path: str) -> bool:
+    p = str(path or "").strip().lower()
+    if not p:
+        return False
+    if BAD_CANDIDATE_RE.search(p):
+        return False
+    return True
 
 
 def scan_money_candidates(obj, path="", out=None, seen=None, depth=0, max_depth=8):
@@ -214,7 +244,7 @@ def scan_money_candidates(obj, path="", out=None, seen=None, depth=0, max_depth=
             new_path = f"{path}.{key_str}" if path else key_str
 
             if isinstance(value, (int, float)) and not isinstance(value, bool):
-                if MONEY_RE.search(new_path):
+                if MONEY_RE.search(new_path) and should_include_candidate(new_path):
                     out.append({
                         "path": new_path,
                         "value": value,
@@ -229,7 +259,7 @@ def scan_money_candidates(obj, path="", out=None, seen=None, depth=0, max_depth=
             new_path = f"{path}.{idx}" if path else str(idx)
 
             if isinstance(value, (int, float)) and not isinstance(value, bool):
-                if MONEY_RE.search(new_path):
+                if MONEY_RE.search(new_path) and should_include_candidate(new_path):
                     out.append({
                         "path": new_path,
                         "value": value,
@@ -338,50 +368,137 @@ def get_value_by_path(obj, path: str):
     return ref
 
 
-def load_renpy_rules(force_refresh: bool = False):
-    global _RULES_CACHE
+def normalize_path_for_match(path: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(path or "").lower())
 
-    if _RULES_CACHE is not None and not force_refresh:
+
+def resolve_rule_candidate(scan_root, rule_path: str, candidates: list):
+    rule_path = str(rule_path or "").strip()
+    if not rule_path:
+        return None
+
+    exact_value = get_value_by_path(scan_root, rule_path)
+    if isinstance(exact_value, (int, float)) and not isinstance(exact_value, bool):
+        return {
+            "path": rule_path,
+            "value": exact_value,
+            "match_mode": "exact",
+        }
+
+    for item in candidates:
+        if item["path"] == rule_path:
+            return {
+                "path": item["path"],
+                "value": item["value"],
+                "match_mode": "candidate-exact",
+            }
+
+    norm_rule = normalize_path_for_match(rule_path)
+    if norm_rule:
+        for item in candidates:
+            if normalize_path_for_match(item["path"]) == norm_rule:
+                return {
+                    "path": item["path"],
+                    "value": item["value"],
+                    "match_mode": "normalized",
+                }
+
+    if norm_rule and candidates:
+        norm_to_item = {}
+        norm_keys = []
+
+        for item in candidates:
+            norm_item = normalize_path_for_match(item["path"])
+            if not norm_item:
+                continue
+            if norm_item not in norm_to_item:
+                norm_to_item[norm_item] = item
+                norm_keys.append(norm_item)
+
+        close = get_close_matches(norm_rule, norm_keys, n=1, cutoff=0.82)
+        if close:
+            matched = norm_to_item[close[0]]
+            return {
+                "path": matched["path"],
+                "value": matched["value"],
+                "match_mode": "fuzzy",
+            }
+
+    return None
+
+
+def load_renpy_rules(force_refresh: bool = False):
+    global _RULES_CACHE, _RULES_CACHE_TS
+
+    now = time.time()
+    if (
+        _RULES_CACHE is not None
+        and not force_refresh
+        and (now - _RULES_CACHE_TS) < _RULES_CACHE_TTL
+    ):
         return _RULES_CACHE
 
     try:
-        with urlopen(RENPY_RULES_URL, timeout=15) as resp:
+        url = f"{RENPY_RULES_URL}?t={int(now)}"
+        with urlopen(url, timeout=15) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
             data = json.loads(raw)
 
         rows = data if isinstance(data, list) else data.get("rows", [])
 
-        rules = {}
+        rules = []
         for row in rows:
-            slug = str(row.get("gameSlug", "") or row.get("slug", "")).strip().lower()
-            money_path = str(row.get("moneyPath", "") or row.get("path", "")).strip()
-            label = str(row.get("label", "")).strip() or money_path
             enabled = str(row.get("enabled", "true")).strip().lower()
-
-            if not slug or not money_path:
-                continue
             if enabled in ("false", "0", "no", "off"):
                 continue
 
-            rules[slug] = {
+            money_path = str(row.get("moneyPath", "") or row.get("path", "")).strip()
+            if not money_path:
+                continue
+
+            rules.append({
+                "gameSlug": str(row.get("gameSlug", "") or row.get("slug", "")).strip().lower(),
+                "title": str(row.get("title", "") or row.get("gameTitle", "") or row.get("name", "")).strip(),
                 "moneyPath": money_path,
-                "label": label
-            }
+                "label": str(row.get("label", "") or money_path).strip(),
+                "enabled": True,
+            })
 
         _RULES_CACHE = rules
+        _RULES_CACHE_TS = now
         return rules
 
     except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
-        _RULES_CACHE = {}
+        _RULES_CACHE = []
+        _RULES_CACHE_TS = now
         return _RULES_CACHE
 
 
-def get_rule_for_slug(slug: str):
-    slug = str(slug or "").strip().lower()
-    if not slug:
-        return None
-    rules = load_renpy_rules()
-    return rules.get(slug)
+def collect_sheet_matches(scan_root, rules, candidates):
+    matches = []
+    seen_paths = set()
+
+    for rule in rules:
+        matched = resolve_rule_candidate(scan_root, rule.get("moneyPath", ""), candidates)
+        if not matched:
+            continue
+
+        path = matched["path"]
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+
+        matches.append({
+            "path": path,
+            "value": matched["value"],
+            "gameSlug": rule.get("gameSlug", ""),
+            "title": rule.get("title", ""),
+            "label": rule.get("label", path),
+            "moneyPath": rule.get("moneyPath", path),
+            "match_mode": matched["match_mode"],
+        })
+
+    return matches
 
 
 @app.get("/")
@@ -389,21 +506,18 @@ def root():
     return {"ok": True, "message": "Eco backend aktif"}
 
 
-@app.post("/api/renpy/test-upload")
-async def test_upload(file: UploadFile = File(...), slug: str = ""):
-    content = await file.read()
-    rule = get_rule_for_slug(slug) if slug else None
+@app.post("/api/renpy/reload-rules")
+async def reload_rules():
+    rules = load_renpy_rules(force_refresh=True)
     return JSONResponse({
         "ok": True,
-        "filename": file.filename,
-        "size": len(content),
-        "slug": slug,
-        "rule_path": rule.get("moneyPath") if rule else None,
+        "rule_count": len(rules),
+        "paths": [r["moneyPath"] for r in rules[:50]],
     })
 
 
 @app.post("/api/renpy/inspect")
-async def renpy_inspect(file: UploadFile = File(...), slug: str = ""):
+async def renpy_inspect(file: UploadFile = File(...)):
     content = await file.read()
 
     if not content:
@@ -412,14 +526,10 @@ async def renpy_inspect(file: UploadFile = File(...), slug: str = ""):
     if len(content) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=400, detail="File terlalu besar.")
 
-    rule = get_rule_for_slug(slug) if slug else None
-
     result = {
         "ok": True,
         "filename": file.filename,
         "size": len(content),
-        "slug": slug,
-        "rule_path": rule.get("moneyPath") if rule else None,
         "is_zip": False,
         "entries": [],
         "has_log": False,
@@ -431,7 +541,6 @@ async def renpy_inspect(file: UploadFile = File(...), slug: str = ""):
     try:
         with zipfile.ZipFile(io.BytesIO(content), "r") as zf:
             names = zf.namelist()
-
             result["is_zip"] = True
             result["entries"] = names
             result["has_log"] = "log" in names
@@ -442,18 +551,12 @@ async def renpy_inspect(file: UploadFile = File(...), slug: str = ""):
                 try:
                     json_text = zf.read("json").decode("utf-8", errors="replace")
                     parsed = json.loads(json_text)
-
                     if isinstance(parsed, dict):
-                        result["json_preview"] = {
-                            key: parsed[key]
-                            for key in list(parsed.keys())[:10]
-                        }
+                        result["json_preview"] = {k: parsed[k] for k in list(parsed.keys())[:10]}
                     else:
                         result["json_preview"] = parsed
                 except Exception as e:
-                    result["json_preview"] = {
-                        "error": f"Gagal parse entry json: {str(e)}"
-                    }
+                    result["json_preview"] = {"error": f"Gagal parse entry json: {str(e)}"}
 
             return JSONResponse(result)
 
@@ -462,69 +565,16 @@ async def renpy_inspect(file: UploadFile = File(...), slug: str = ""):
             "ok": False,
             "filename": file.filename,
             "size": len(content),
-            "slug": slug,
-            "rule_path": rule.get("moneyPath") if rule else None,
             "error": "File ini bukan ZIP Ren'Py yang valid.",
         })
 
 
-@app.post("/api/renpy/read-log")
-async def renpy_read_log(file: UploadFile = File(...), slug: str = ""):
-    content = await file.read()
-
-    if not content:
-        raise HTTPException(status_code=400, detail="File kosong.")
-
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=400, detail="File terlalu besar.")
-
-    rule = get_rule_for_slug(slug) if slug else None
-
-    try:
-        with zipfile.ZipFile(io.BytesIO(content), "r") as zf:
-            names = zf.namelist()
-
-            if "log" not in names:
-                raise HTTPException(status_code=400, detail="Entry 'log' tidak ditemukan.")
-
-            log_bytes = zf.read("log")
-
-            return JSONResponse({
-                "ok": True,
-                "filename": file.filename,
-                "slug": slug,
-                "rule_path": rule.get("moneyPath") if rule else None,
-                "entries": names,
-                "log_size": len(log_bytes),
-                "log_sha256": hashlib.sha256(log_bytes).hexdigest(),
-                "log_base64": base64.b64encode(log_bytes).decode("ascii"),
-            })
-
-    except zipfile.BadZipFile:
-        raise HTTPException(status_code=400, detail="File ini bukan ZIP Ren'Py yang valid.")
-
-
-@app.post("/api/renpy/find-candidates")
-async def renpy_find_candidates(file: UploadFile = File(...), slug: str = ""):
-    content = await file.read()
-
-    if not content:
-        raise HTTPException(status_code=400, detail="File kosong.")
-
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=400, detail="File terlalu besar.")
-
-    try:
-        with zipfile.ZipFile(io.BytesIO(content), "r") as zf:
-            names = zf.namelist()
-
-            if "log" not in names:
-                raise HTTPException(status_code=400, detail="Entry 'log' tidak ditemukan.")
-
-            log_bytes = zf.read("log")
-
-    except zipfile.BadZipFile:
-        raise HTTPException(status_code=400, detail="File ini bukan ZIP Ren'Py yang valid.")
+def build_candidates_and_matches(file_name: str, content: bytes):
+    with zipfile.ZipFile(io.BytesIO(content), "r") as zf:
+        names = zf.namelist()
+        if "log" not in names:
+            raise HTTPException(status_code=400, detail="Entry 'log' tidak ditemukan.")
+        log_bytes = zf.read("log")
 
     try:
         parsed = tolerant_load_pickle(log_bytes)
@@ -535,14 +585,10 @@ async def renpy_find_candidates(file: UploadFile = File(...), slug: str = ""):
             detail=f"Gagal parse pickle log: {type(e).__name__}: {str(e)}",
         )
 
-    slug = str(slug or "").strip().lower()
-    rule = get_rule_for_slug(slug) if slug else None
-
-    candidates = scan_money_candidates(scan_root)
-
+    raw_candidates = scan_money_candidates(scan_root)
     seen = set()
     unique_candidates = []
-    for item in sorted(candidates, key=lambda x: (x["score"], x["path"])):
+    for item in sorted(raw_candidates, key=lambda x: (x["score"], x["path"])):
         sig = (item["path"], item["value"])
         if sig in seen:
             continue
@@ -552,40 +598,71 @@ async def renpy_find_candidates(file: UploadFile = File(...), slug: str = ""):
             "value": item["value"],
         })
 
-    if rule:
-        rule_path = rule.get("moneyPath", "")
-        rule_value = get_value_by_path(scan_root, rule_path)
+    rules = load_renpy_rules()
+    matched_paths = collect_sheet_matches(scan_root, rules, unique_candidates)
 
-        if isinstance(rule_value, (int, float)) and not isinstance(rule_value, bool):
-            unique_candidates = [
-                {"path": rule_path, "value": rule_value}
-            ] + [c for c in unique_candidates if c["path"] != rule_path]
+    if matched_paths:
+        display_candidates = [
+            {"path": item["path"], "value": item["value"]}
+            for item in matched_paths
+        ]
+        used_sheet_match = True
+    else:
+        display_candidates = unique_candidates[:100]
+        used_sheet_match = False
+
+    return {
+        "filename": file_name,
+        "parsed": parsed,
+        "scan_root": scan_root,
+        "log_bytes": log_bytes,
+        "entries": names,
+        "matched_paths": matched_paths,
+        "candidates": display_candidates,
+        "used_sheet_match": used_sheet_match,
+        "parsed_type": type(parsed).__name__,
+        "scan_root_type": type(scan_root).__name__,
+    }
+
+
+@app.post("/api/renpy/find-candidates")
+async def renpy_find_candidates(file: UploadFile = File(...)):
+    content = await file.read()
+
+    if not content:
+        raise HTTPException(status_code=400, detail="File kosong.")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="File terlalu besar.")
+
+    try:
+        result = build_candidates_and_matches(file.filename, content)
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="File ini bukan ZIP Ren'Py yang valid.")
 
     return JSONResponse({
         "ok": True,
         "filename": file.filename,
-        "slug": slug,
-        "rule_path": rule.get("moneyPath") if rule else None,
-        "entries": names,
-        "parsed_type": type(parsed).__name__,
-        "scan_root_type": type(scan_root).__name__,
-        "candidate_count": len(unique_candidates),
-        "candidates": unique_candidates[:100],
+        "entries": result["entries"],
+        "parsed_type": result["parsed_type"],
+        "scan_root_type": result["scan_root_type"],
+        "used_sheet_match": result["used_sheet_match"],
+        "matched_count": len(result["matched_paths"]),
+        "matched_paths": result["matched_paths"][:100],
+        "candidate_count": len(result["candidates"]),
+        "candidates": result["candidates"][:100],
     })
 
 
 @app.post("/api/renpy/edit-money")
 async def renpy_edit_money(
     file: UploadFile = File(...),
-    slug: str = "",
     path: str = "",
-    value: int = 999999
+    value: int = 999999,
 ):
     content = await file.read()
 
     if not content:
         raise HTTPException(status_code=400, detail="File kosong.")
-
     if len(content) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=400, detail="File terlalu besar.")
 
@@ -595,15 +672,11 @@ async def renpy_edit_money(
     try:
         with zipfile.ZipFile(io.BytesIO(content), "r") as zf:
             names = zf.namelist()
-
             if "log" not in names:
                 raise HTTPException(status_code=400, detail="Entry 'log' tidak ditemukan.")
-
             for name in names:
                 original_entries[name] = zf.read(name)
-
             log_bytes = original_entries["log"]
-
     except zipfile.BadZipFile:
         raise HTTPException(status_code=400, detail="File ini bukan ZIP Ren'Py yang valid.")
 
@@ -616,20 +689,19 @@ async def renpy_edit_money(
             detail=f"Gagal parse pickle log: {type(e).__name__}: {str(e)}",
         )
 
-    slug = str(slug or "").strip().lower()
-    rule = get_rule_for_slug(slug) if slug else None
+    auto_candidates = scan_money_candidates(scan_root)
+    auto_candidates = sorted(auto_candidates, key=lambda x: (x["score"], x["path"]))
+    rules = load_renpy_rules()
+    matched_paths = collect_sheet_matches(scan_root, rules, auto_candidates)
 
-    if not path and rule:
-        path = rule.get("moneyPath", "")
+    if not path and matched_paths:
+        path = matched_paths[0]["path"]
+
+    if not path and auto_candidates:
+        path = auto_candidates[0]["path"]
 
     if not path:
-        auto_candidates = scan_money_candidates(scan_root)
-        if auto_candidates:
-            auto_candidates = sorted(auto_candidates, key=lambda x: (x["score"], x["path"]))
-            path = auto_candidates[0]["path"]
-
-    if not path:
-        raise HTTPException(status_code=400, detail="Path uang tidak ditemukan dari slug maupun scan otomatis.")
+        raise HTTPException(status_code=400, detail="Path target tidak ditemukan dari rules maupun scan otomatis.")
 
     try:
         set_value_by_path(scan_root, path, value)
@@ -641,7 +713,6 @@ async def renpy_edit_money(
         )
 
     out = io.BytesIO()
-
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for name in names:
             if name == "log":
@@ -650,19 +721,15 @@ async def renpy_edit_money(
                 zf.writestr(name, original_entries[name])
 
     edited_bytes = out.getvalue()
-    edited_name = file.filename
-    if edited_name.endswith(".save"):
-        edited_name = edited_name[:-5] + "-edited.save"
-    else:
-        edited_name = edited_name + "-edited.save"
+    edited_name = file.filename[:-5] + "-edited.save" if file.filename.endswith(".save") else file.filename + "-edited.save"
 
     return JSONResponse({
         "ok": True,
         "filename": file.filename,
         "edited_filename": edited_name,
-        "slug": slug,
-        "rule_path": rule.get("moneyPath") if rule else None,
         "path": path,
+        "used_sheet_match": bool(matched_paths),
+        "matched_paths": matched_paths[:100],
         "new_value": value,
         "old_log_sha256": hashlib.sha256(log_bytes).hexdigest(),
         "new_log_sha256": hashlib.sha256(new_log_bytes).hexdigest(),
